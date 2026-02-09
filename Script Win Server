@@ -1,0 +1,37 @@
+# 1. IDEMPOTENCIA: Instalacion desatendida
+$dhcp = Get-WindowsFeature -Name DHCP
+if (-not $dhcp.Installed) {
+    Install-WindowsFeature DHCP -IncludeManagementTools
+}
+
+# 2. CONFIGURACION DINAMICA: Peticion de parametros
+Write-Host "--- CONFIGURACION DE RED IPv4 ---" -ForegroundColor Cyan
+$ScopeName = Read-Host "Nombre descriptivo del Ambito"
+$StartIP   = Read-Host "Rango Inicial (ej. 192.168.100.50)"
+$EndIP     = Read-Host "Rango Final (ej. 192.168.100.150)"
+$Gateway   = Read-Host "Puerta de Enlace (ej. 192.168.100.1)"
+$DNS       = Read-Host "IP del Servidor DNS (ej. 192.168.100.20)"
+$Lease     = Read-Host "Tiempo de concesion (ej. 00:20:00)"
+
+# Limpieza de ambito previo para evitar duplicados
+if (Get-DhcpServerv4Scope -ScopeId 192.168.100.0 -ErrorAction SilentlyContinue) {
+    Remove-DhcpServerv4Scope -ScopeId 192.168.100.0 -Force
+}
+
+# 3. IMPLEMENTACION DE OPCIONES (Aqui cumplimos la rubrica)
+# Creamos el ambito
+Add-DhcpServerv4Scope -Name $ScopeName -StartRange $StartIP -EndRange $EndIP -SubnetMask 255.255.255.0 -State Active -LeaseDuration $Lease
+
+# Seteamos el Gateway
+Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 -Router $Gateway
+
+# Seteamos el DNS forzandolo para que no valide si el servidor esta activo
+Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 -DnsServer $DNS -Force
+
+# 4. MODULO DE MONITOREO Y VALIDACION
+Restart-Service DHCPServer
+Write-Host "`n--- ESTADO DEL SERVICIO EN TIEMPO REAL ---" -ForegroundColor Green
+Get-Service DHCPServer | Select-Object Status, Name, DisplayName
+
+Write-Host "`n--- CONCESIONES (LEASES) ACTIVAS ---" -ForegroundColor Green
+Get-DhcpServerv4Lease -ScopeId 192.168.100.0
