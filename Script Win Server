@@ -1,37 +1,102 @@
-# 1. IDEMPOTENCIA: Instalacion desatendida
-$dhcp = Get-WindowsFeature -Name DHCP
-if (-not $dhcp.Installed) {
-    Install-WindowsFeature DHCP -IncludeManagementTools
+# =========================================================
+# SCRIPT DE ADMINISTRACION DHCP PROFESIONAL - WINDOWS
+# =========================================================
+
+# 1. Funcion para encapsular y validar formato de IP
+function Validar-IP ($IP) {
+    $regex = "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
+    return ($IP -match $regex)
 }
 
-# 2. CONFIGURACION DINAMICA: Peticion de parametros
-Write-Host "--- CONFIGURACION DE RED IPv4 ---" -ForegroundColor Cyan
-$ScopeName = Read-Host "Nombre descriptivo del Ambito"
-$StartIP   = Read-Host "Rango Inicial (ej. 192.168.100.50)"
-$EndIP     = Read-Host "Rango Final (ej. 192.168.100.150)"
-$Gateway   = Read-Host "Puerta de Enlace (ej. 192.168.100.1)"
-$DNS       = Read-Host "IP del Servidor DNS (ej. 192.168.100.20)"
-$Lease     = Read-Host "Tiempo de concesion (ej. 00:20:00)"
+# 2. Funcion para comparar Segmento y Orden
+function Validar-Rango ($IPI, $IPF) {
+    $octetosI = $IPI.Split('.')
+    $octetosF = $IPF.Split('.')
+    
+    # Validar mismo segmento (Clase C: primeros 3 octetos)
+    $segI = "$($octetosI[0]).$($octetosI[1]).$($octetosI[2])"
+    $segF = "$($octetosF[0]).$($octetosF[1]).$($octetosF[2])"
 
-# Limpieza de ambito previo para evitar duplicados
-if (Get-DhcpServerv4Scope -ScopeId 192.168.100.0 -ErrorAction SilentlyContinue) {
-    Remove-DhcpServerv4Scope -ScopeId 192.168.100.0 -Force
+    if ($segI -ne $segF) {
+        Write-Host "[ERROR] Segmento distinto: $segI vs $segF" -ForegroundColor Red
+        return $false
+    }
+
+    # Validar orden (Ultimo octeto)
+    if ([int]$octetosI[3] -ge [int]$octetosF[3]) {
+        Write-Host "[ERROR] La IP Inicial ($($octetosI[3])) no es menor a la Final ($($octetosF[3]))" -ForegroundColor Red
+        return $false
+    }
+    return $true
 }
 
-# 3. IMPLEMENTACION DE OPCIONES (Aqui cumplimos la rubrica)
-# Creamos el ambito
-Add-DhcpServerv4Scope -Name $ScopeName -StartRange $StartIP -EndRange $EndIP -SubnetMask 255.255.255.0 -State Active -LeaseDuration $Lease
+# 3. Generar Mascara (Clase C Automatica)
+function Obtener-Mascara { return "255.255.255.0" }
 
-# Seteamos el Gateway
-Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 -Router $Gateway
+# --- MENU PRINCIPAL ---
+do {
+    Write-Host "`n========================================" -ForegroundColor Cyan
+    Write-Host "       MENU DE GESTION DHCP (WIN)"
+    Write-Host "========================================"
+    Write-Host "1) Verificar Instalacion"
+    Write-Host "2) Instalacion Silenciosa / Configurar"
+    Write-Host "3) Monitoreo (Ver IPs Asignadas)"
+    Write-Host "4) Borrar / Desinstalar Servicio (Limpieza)"
+    Write-Host "5) Salir"
+    $opcion = Read-Host "Elija una opcion"
 
-# Seteamos el DNS forzandolo para que no valide si el servidor esta activo
-Set-DhcpServerv4OptionValue -ScopeId 192.168.100.0 -DnsServer $DNS -Force
+    switch ($opcion) {
+        "1" {
+            $status = Get-WindowsFeature DHCP
+            if ($status.Installed) {
+                Write-Host "[ESTADO] DHCP Instalado y Activo" -ForegroundColor Green
+            } else {
+                Write-Host "[ESTADO] DHCP No detectado (Maquina Limpia)" -ForegroundColor Yellow
+            }
+        }
 
-# 4. MODULO DE MONITOREO Y VALIDACION
-Restart-Service DHCPServer
-Write-Host "`n--- ESTADO DEL SERVICIO EN TIEMPO REAL ---" -ForegroundColor Green
-Get-Service DHCPServer | Select-Object Status, Name, DisplayName
+        "2" {
+            if ((Get-WindowsFeature DHCP).Installed) {
+                $reinst = Read-Host "El servicio ya existe. Desea reconfigurar el ambito? (s/n)"
+                if ($reinst -ne "s") { break }
+                # Borrar ambitos anteriores para evitar errores de duplicado
+                Get-DhcpServerv4Scope | Remove-DhcpServerv4Scope -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Host "Instalando Rol DHCP de forma silenciosa..." -ForegroundColor Gray
+                Install-WindowsFeature DHCP -IncludeManagementTools | Out-Null
+                netsh dhcp add securitygroups | Out-Null
+                Restart-Service dhcpserver
+            }
+            
+            $ipI = Read-Host "IP Inicial (ej: 192.168.100.50)"
+            $ipF = Read-Host "IP Final (ej: 192.168.100.150)"
 
-Write-Host "`n--- CONCESIONES (LEASES) ACTIVAS ---" -ForegroundColor Green
-Get-DhcpServerv4Lease -ScopeId 192.168.100.0
+            if ((Validar-IP $ipI) -and (Validar-IP $ipF)) {
+                if (Validar-Rango $ipI $ipF) {
+                    $m = Obtener-Mascara
+                    Add-DhcpServerv4Scope -Name "Red_Escuela" -StartRange $ipI -EndRange $ipF -SubnetMask $m
+                    Write-Host "Ambito configurado exitosamente!" -ForegroundColor Green
+                }
+            } else { Write-Host "Formato de IP incorrecto." -ForegroundColor Red }
+        }
+
+        "3" {
+            Write-Host "--- LISTA DE CONCESIONES ACTIVAS ---" -ForegroundColor Magenta
+            $scope = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue
+            if ($scope) {
+                Get-DhcpServerv4Lease -ScopeId $scope.ScopeId | Select-Object IPAddress, HostName, ClientId
+            } else {
+                Write-Host "No hay ambitos configurados para monitorear." -ForegroundColor Yellow
+            }
+        }
+
+        "4" {
+            Write-Host "Borrando configuracion y desinstalando DHCP..." -ForegroundColor Red
+            # Primero quitamos la autorizacion y ambitos
+            Get-DhcpServerv4Scope | Remove-DhcpServerv4Scope -Force -ErrorAction SilentlyContinue
+            # Desinstalamos el Rol
+            Uninstall-WindowsFeature DHCP -IncludeManagementTools | Out-Null
+            Write-Host "Sistema limpio. Se recomienda reiniciar la VM para completar." -ForegroundColor Yellow
+        }
+    }
+} while ($opcion -ne "5")
