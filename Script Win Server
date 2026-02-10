@@ -1,11 +1,25 @@
 # =========================================================
-# SCRIPT DE ADMINISTRACION DHCP PROFESIONAL - WINDOWS
+# MENU SCRIPT - WINDOWS
 # =========================================================
 
-# 1. Funcion para encapsular y validar formato de IP
+# 1. Funcion para encapsular y validar formato de IP (Blindada)
 function Validar-IP ($IP) {
+    # Regex estandar para formato 0-255 en 4 octetos
     $regex = "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
-    return ($IP -match $regex)
+    
+    if ($IP -match $regex) {
+        # Extraer el primer octeto para validaciones logicas de red
+        $primerOcteto = [int]$IP.Split('.')[0]
+        
+        # --- FILTROS DE SEGURIDAD PARA REDES ---
+        # No permitir 0.x.x.x (Nulas), 127.x.x.x (Loopback) ni 224+ (Multicast/Reservadas)
+        if ($primerOcteto -eq 0 -or $primerOcteto -eq 127 -or $primerOcteto -ge 224) {
+            Write-Host "La IP $IP es una direccion reservada o invalida para DHCP." -ForegroundColor Red
+            return $false
+        }
+        return $true
+    }
+    return $false
 }
 
 # 2. Funcion para comparar Segmento y Orden
@@ -24,7 +38,7 @@ function Validar-Rango ($IPI, $IPF) {
 
     # Validar orden (Ultimo octeto)
     if ([int]$octetosI[3] -ge [int]$octetosF[3]) {
-        Write-Host "[ERROR] La IP Inicial ($($octetosI[3])) no es menor a la Final ($($octetosF[3]))" -ForegroundColor Red
+        Write-Host "La IP Inicial ($($octetosI[3])) no es menor a la Final ($($octetosF[3]))" -ForegroundColor Red
         return $false
     }
     return $true
@@ -36,7 +50,7 @@ function Obtener-Mascara { return "255.255.255.0" }
 # --- MENU PRINCIPAL ---
 do {
     Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "       MENU DE GESTION DHCP (WIN)"
+    Write-Host "        MENU DE GESTION DHCP (WIN)"
     Write-Host "========================================"
     Write-Host "1) Verificar Instalacion"
     Write-Host "2) Instalacion Silenciosa / Configurar"
@@ -64,6 +78,7 @@ do {
             } else {
                 Write-Host "Instalando Rol DHCP de forma silenciosa..." -ForegroundColor Gray
                 Install-WindowsFeature DHCP -IncludeManagementTools | Out-Null
+                # Agregar grupos de seguridad para DHCP
                 netsh dhcp add securitygroups | Out-Null
                 Restart-Service dhcpserver
             }
@@ -74,10 +89,13 @@ do {
             if ((Validar-IP $ipI) -and (Validar-IP $ipF)) {
                 if (Validar-Rango $ipI $ipF) {
                     $m = Obtener-Mascara
+                    # Configuracion del ambito (Scope)
                     Add-DhcpServerv4Scope -Name "Red_Escuela" -StartRange $ipI -EndRange $ipF -SubnetMask $m
-                    Write-Host "Ambito configurado exitosamente!" -ForegroundColor Green
+                    Write-Host "Ambito configurado exitosamente con mascara $m" -ForegroundColor Green
                 }
-            } else { Write-Host "Formato de IP incorrecto." -ForegroundColor Red }
+            } else { 
+                Write-Host "Error: Los datos ingresados no son validos para una red DHCP." -ForegroundColor Red 
+            }
         }
 
         "3" {
@@ -86,17 +104,17 @@ do {
             if ($scope) {
                 Get-DhcpServerv4Lease -ScopeId $scope.ScopeId | Select-Object IPAddress, HostName, ClientId
             } else {
-                Write-Host "No hay ambitos configurados para monitorear." -ForegroundColor Yellow
+                Write-Host "No hay ambitos configurados, configure uno en la opcion 2." -ForegroundColor Yellow
             }
         }
 
         "4" {
             Write-Host "Borrando configuracion y desinstalando DHCP..." -ForegroundColor Red
-            # Primero quitamos la autorizacion y ambitos
+            # Eliminar ambitos antes de desinstalar
             Get-DhcpServerv4Scope | Remove-DhcpServerv4Scope -Force -ErrorAction SilentlyContinue
-            # Desinstalamos el Rol
+            # Desinstalacion del Rol y herramientas de administracion
             Uninstall-WindowsFeature DHCP -IncludeManagementTools | Out-Null
-            Write-Host "Sistema limpio. Se recomienda reiniciar la VM para completar." -ForegroundColor Yellow
+            Write-Host "Sistema limpio. Se recomienda reiniciar para aplicar cambios." -ForegroundColor Yellow
         }
     }
 } while ($opcion -ne "5")
