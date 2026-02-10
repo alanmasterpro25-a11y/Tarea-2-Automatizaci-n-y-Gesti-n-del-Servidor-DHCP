@@ -1,120 +1,83 @@
+#!/bin/bash
 # =========================================================
-# MENU SCRIPT - WINDOWS
+# SMENU WINDOWS
 # =========================================================
 
-# 1. Funcion para encapsular y validar formato de IP (Blindada)
-function Validar-IP ($IP) {
-    # Regex estandar para formato 0-255 en 4 octetos
-    $regex = "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
-    
-    if ($IP -match $regex) {
-        # Extraer el primer octeto para validaciones logicas de red
-        $primerOcteto = [int]$IP.Split('.')[0]
+# 1. Funcion de Validacion de IP (Ahora bloquea IPs que empiezan con 0, 127 y 224+)
+validar_ip() {
+    local ip=$1
+    if [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        local primer_octeto=$(echo $ip | cut -d. -f1)
         
-        # --- FILTROS DE SEGURIDAD PARA REDES ---
-        # No permitir 0.x.x.x (Nulas), 127.x.x.x (Loopback) ni 224+ (Multicast/Reservadas)
-        if ($primerOcteto -eq 0 -or $primerOcteto -eq 127 -or $primerOcteto -ge 224) {
-            Write-Host "La IP $IP es una direccion reservada o invalida para DHCP." -ForegroundColor Red
-            return $false
-        }
-        return $true
-    }
-    return $false
+        # Filtros de seguridad (Igual que en Windows)
+        if [ "$primer_octeto" -eq 0 ] || [ "$primer_octeto" -eq 127 ] || [ "$primer_octeto" -ge 224 ]; then
+            echo -e "\e[31m[!] La IP $ip es reservada o invalida para DHCP.\e[0m"
+            return 1
+        fi
+        return 0
+    else
+        return 1
+    fi
 }
 
-# 2. Funcion para comparar Segmento y Orden
-function Validar-Rango ($IPI, $IPF) {
-    $octetosI = $IPI.Split('.')
-    $octetosF = $IPF.Split('.')
-    
-    # Validar mismo segmento (Clase C: primeros 3 octetos)
-    $segI = "$($octetosI[0]).$($octetosI[1]).$($octetosI[2])"
-    $segF = "$($octetosF[0]).$($octetosF[1]).$($octetosF[2])"
+validar_segmento_orden() {
+    local red1=$(echo $1 | cut -d. -f1-3)
+    local red2=$(echo $2 | cut -d. -f1-3)
+    local host1=$(echo $1 | cut -d. -f4)
+    local host2=$(echo $2 | cut -d. -f4)
 
-    if ($segI -ne $segF) {
-        Write-Host "[ERROR] Segmento distinto: $segI vs $segF" -ForegroundColor Red
-        return $false
-    }
-
-    # Validar orden (Ultimo octeto)
-    if ([int]$octetosI[3] -ge [int]$octetosF[3]) {
-        Write-Host "La IP Inicial ($($octetosI[3])) no es menor a la Final ($($octetosF[3]))" -ForegroundColor Red
-        return $false
-    }
-    return $true
+    [ "$red1" != "$red2" ] && echo -e "\e[31m[ERROR] Segmentos diferentes.\e[0m" && return 1
+    [ "$host1" -ge "$host2" ] && echo -e "\e[31m[ERROR] Orden de IPs incorrecto.\e[0m" && return 1
+    return 0
 }
-
-# 3. Generar Mascara (Clase C Automatica)
-function Obtener-Mascara { return "255.255.255.0" }
 
 # --- MENU PRINCIPAL ---
-do {
-    Write-Host "`n========================================" -ForegroundColor Cyan
-    Write-Host "        MENU DE GESTION DHCP (WIN)"
-    Write-Host "========================================"
-    Write-Host "1) Verificar Instalacion"
-    Write-Host "2) Instalacion Silenciosa / Configurar"
-    Write-Host "3) Monitoreo (Ver IPs Asignadas)"
-    Write-Host "4) Borrar / Desinstalar Servicio (Limpieza)"
-    Write-Host "5) Salir"
-    $opcion = Read-Host "Elija una opcion"
+while true; do
+    echo -e "\n========================================"
+    echo "    MENU GESTION DHCP (LINUX - ENS34)"
+    echo "========================================"
+    echo "1) Verificar Instalacion"
+    echo "2) Instalacion / Configurar (Segura)"
+    echo "3) Monitoreo (Ver IPs Asignadas)"
+    echo "4) Borrar / Desinstalar (Limpieza)"
+    echo "5) Salir"
+    read -p "Elija una opcion: " opcion
 
-    switch ($opcion) {
-        "1" {
-            $status = Get-WindowsFeature DHCP
-            if ($status.Installed) {
-                Write-Host "[ESTADO] DHCP Instalado y Activo" -ForegroundColor Green
-            } else {
-                Write-Host "[ESTADO] DHCP No detectado (Maquina Limpia)" -ForegroundColor Yellow
-            }
-        }
+    case $opcion in
+        1)
+            dpkg -l | grep -q isc-dhcp-server && echo -e "\e[32m[INSTALADO]\e[0m" || echo -e "\e[33m[LIMPIO]\e[0m"
+            ;;
+        2)
+            read -p "IP Inicial: " IPI
+            read -p "IP Final: " IPF
 
-        "2" {
-            if ((Get-WindowsFeature DHCP).Installed) {
-                $reinst = Read-Host "El servicio ya existe. Desea reconfigurar el ambito? (s/n)"
-                if ($reinst -ne "s") { break }
-                # Borrar ambitos anteriores para evitar errores de duplicado
-                Get-DhcpServerv4Scope | Remove-DhcpServerv4Scope -Force -ErrorAction SilentlyContinue
-            } else {
-                Write-Host "Instalando Rol DHCP de forma silenciosa..." -ForegroundColor Gray
-                Install-WindowsFeature DHCP -IncludeManagementTools | Out-Null
-                # Agregar grupos de seguridad para DHCP
-                netsh dhcp add securitygroups | Out-Null
-                Restart-Service dhcpserver
-            }
-            
-            $ipI = Read-Host "IP Inicial (ej: 192.168.100.50)"
-            $ipF = Read-Host "IP Final (ej: 192.168.100.150)"
-
-            if ((Validar-IP $ipI) -and (Validar-IP $ipF)) {
-                if (Validar-Rango $ipI $ipF) {
-                    $m = Obtener-Mascara
-                    # Configuracion del ambito (Scope)
-                    Add-DhcpServerv4Scope -Name "Red_Escuela" -StartRange $ipI -EndRange $ipF -SubnetMask $m
-                    Write-Host "Ambito configurado exitosamente con mascara $m" -ForegroundColor Green
-                }
-            } else { 
-                Write-Host "Error: Los datos ingresados no son validos para una red DHCP." -ForegroundColor Red 
-            }
-        }
-
-        "3" {
-            Write-Host "--- LISTA DE CONCESIONES ACTIVAS ---" -ForegroundColor Magenta
-            $scope = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue
-            if ($scope) {
-                Get-DhcpServerv4Lease -ScopeId $scope.ScopeId | Select-Object IPAddress, HostName, ClientId
-            } else {
-                Write-Host "No hay ambitos configurados, configure uno en la opcion 2." -ForegroundColor Yellow
-            }
-        }
-
-        "4" {
-            Write-Host "Borrando configuracion y desinstalando DHCP..." -ForegroundColor Red
-            # Eliminar ambitos antes de desinstalar
-            Get-DhcpServerv4Scope | Remove-DhcpServerv4Scope -Force -ErrorAction SilentlyContinue
-            # Desinstalacion del Rol y herramientas de administracion
-            Uninstall-WindowsFeature DHCP -IncludeManagementTools | Out-Null
-            Write-Host "Sistema limpio. Se recomienda reiniciar para aplicar cambios." -ForegroundColor Yellow
-        }
-    }
-} while ($opcion -ne "5")
+            if validar_ip $IPI && validar_ip $IPF; then
+                if validar_segmento_orden $IPI $IPF; then
+                    echo "Configurando ens34..."
+                    # (Aqui va el resto de la logica de instalacion que ya tenias)
+                    # Forzando la interfaz ens34 y escribiendo dhcpd.conf
+                    sudo apt-get update -qq && sudo apt-get install isc-dhcp-server -y -qq
+                    sudo bash -c "cat <<EOF > /etc/dhcp/dhcpd.conf
+authoritative;
+subnet $(echo $IPI | cut -d. -f1-3).0 netmask 255.255.255.0 {
+  range $IPI $IPF;
+  option routers $(echo $IPI | cut -d. -f1-3).1;
+}
+EOF"
+                    sudo sed -i 's/INTERFACESv4=".*"/INTERFACESv4="ens34"/' /etc/default/isc-dhcp-server
+                    sudo systemctl restart isc-dhcp-server
+                    echo -e "\e[32mServidor Activo en ens34.\e[0m"
+                fi
+            fi
+            ;;
+        3)
+            echo "--- LEASES ACTIVOS ---"
+            sudo grep "lease" /var/lib/dhcp/dhcpd.leases | sort | uniq
+            ;;
+        4)
+            sudo apt-get purge isc-dhcp-server -y -qq && sudo rm -rf /etc/dhcp
+            echo -e "\e[33mServicio eliminado.\e[0m"
+            ;;
+        5) exit ;;
+    esac
+done
