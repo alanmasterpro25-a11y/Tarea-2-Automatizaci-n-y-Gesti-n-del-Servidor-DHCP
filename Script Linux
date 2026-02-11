@@ -1,114 +1,135 @@
 #!/bin/bash
 
 # =========================================================
-# SCRIPT DE ADMINISTRACION DHCP - FIJO PARA ENS34
+#       SISTEMA DE GESTIÓN DHCP PROFESIONAL (LINUX)
 # =========================================================
 
-# --- FUNCIONES DE VALIDACION ---
-
+# 1. Validaciones de Red
 validar_ip() {
     local ip=$1
     if [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        local oct1=$(echo $ip | cut -d. -f1)
+        if [ "$oct1" -eq 127 ] || [ "$oct1" -eq 0 ] || [ "$oct1" -ge 224 ]; then
+            echo -e "\e[31m[!] IP Prohibida (Loopback o Reservada)\e[0m"
+            return 1
+        fi
         return 0
-    else
-        return 1
     fi
+    echo -e "\e[31m[!] Formato de IP invalido\e[0m"
+    return 1
 }
 
-validar_segmento_orden() {
-    local ip1=$1
-    local ip2=$2
-    local red1=$(echo $ip1 | cut -d. -f1-3)
-    local red2=$(echo $ip2 | cut -d. -f2-4) # Error corregido en corte para comparacion
-    red2=$(echo $ip2 | cut -d. -f1-3)
-    
-    local host1=$(echo $ip1 | cut -d. -f4)
-    local host2=$(echo $ip2 | cut -d. -f4)
+validar_rango() {
+    local r1=$(echo $1 | cut -d. -f1-3)
+    local r2=$(echo $2 | cut -d. -f1-3)
+    local h1=$(echo $1 | cut -d. -f4)
+    local h2=$(echo $2 | cut -d. -f4)
 
-    if [ "$red1" != "$red2" ]; then
-        echo -e "\e[31m[ERROR] Las IPs no pertenecen al mismo segmento ($red1 vs $red2).\e[0m"
+    if [ "$r1" != "$r2" ]; then
+        echo -e "\e[31m[ERROR] Las IPs deben pertenecer al mismo segmento\e[0m"
         return 1
     fi
-
-    if [ "$host1" -ge "$host2" ]; then
-        echo -e "\e[31m[ERROR] La IP Inicial ($host1) debe ser menor a la Final ($host2).\e[0m"
+    if [ "$h1" -ge "$h2" ]; then
+        echo -e "\e[31m[ERROR] La IP inicial debe ser menor a la final\e[0m"
         return 1
     fi
     return 0
 }
 
-# --- MENU PRINCIPAL ---
+# 2. Configuracion Forzada de IP Estatica (Servidor)
+configurar_red_servidor() {
+    local ip=$1
+    local iface="ens34"
+    echo -e "Aplicando IP fija $ip en $iface..."
+    sudo ip addr flush dev $iface
+    sudo ip addr add $ip/24 dev $iface
+    sudo ip link set $iface up
+}
 
+# --- MENU PRINCIPAL ---
 while true; do
-    echo ""
-    echo "========================================"
-    echo "    MENU GESTION DHCP (FIJO: ENS34)"
+    echo -e "\n========================================"
+    echo "        MENU GESTION DHCP (LINUX)"
     echo "========================================"
     echo "1) Verificar Instalacion"
-    echo "2) Instalacion / Configurar (Silenciosa)"
-    echo "3) Monitoreo (Ver IPs Asignadas)"
-    echo "4) Desinstalar / Limpiar Servicio"
+    echo "2) Instalacion + Scope (Completo)"
+    echo "3) Monitoreo de Concesiones"
+    echo "4) Limpieza Total del Sistema"
     echo "5) Salir"
     read -p "Elija una opcion: " opcion
 
     case $opcion in
         1)
             if dpkg -l | grep -q isc-dhcp-server; then
-                echo -e "\e[32m[ESTADO] Servicio DHCP instalado y detectado.\e[0m"
+                echo -e "\e[32mEstado: Instalado\e[0m"
             else
-                echo -e "\e[33m[ESTADO] Servicio NO instalado (Maquina Limpia).\e[0m"
+                echo -e "\e[33mEstado: Limpio\e[0m"
             fi
             ;;
         2)
-            # Definimos la interfaz fija para tu practica
-            IFACE="ens34"
-
             if ! dpkg -l | grep -q isc-dhcp-server; then
-                echo "Instalando isc-dhcp-server..."
-                sudo apt-get update -qq && sudo apt-get install isc-dhcp-server -y -qq
+                echo "Instalando servicio silenciosamente..."
+                sudo apt-get update -qq && sudo apt-get install isc-dhcp-server -y -qq > /dev/null 2>&1
             fi
 
-            read -p "Ingrese IP Inicial: " IPI
-            read -p "Ingrese IP Final: " IPF
+            read -p "Nombre del Ambito: " ambito
+            
+            while true; do
+                read -p "IP Inicial (Sera la IP Fija del Servidor): " IPI
+                validar_ip $IPI && break
+            done
+            while true; do
+                read -p "IP Final del Rango: " IPF
+                validar_ip $IPF && break
+            done
 
-            if validar_ip $IPI && validar_ip $IPF; then
-                if validar_segmento_orden $IPI $IPF; then
-                    NETWORK=$(echo $IPI | cut -d. -f1-3).0
-                    MASK="255.255.255.0"
-                    
-                    # 1. Configurar el archivo dhcpd.conf
-                    sudo bash -c "cat <<EOF > /etc/dhcp/dhcpd.conf
+            if validar_rango $IPI $IPF; then
+                configurar_red_servidor $IPI
+                
+                SEG=$(echo $IPI | cut -d. -f1-3)
+                POOL_I="$SEG.$(( $(echo $IPI | cut -d. -f4) + 1 ))"
+                GW="$SEG.1"
+                
+                sudo bash -c "cat <<EOF > /etc/dhcp/dhcpd.conf
 authoritative;
-subnet $NETWORK netmask $MASK {
-  range $IPI $IPF;
-  option routers $(echo $IPI | cut -d. -f1-3).1;
-  option domain-name-servers 192.168.100.20;
+default-lease-time 28800;
+max-lease-time 28800;
+
+subnet $SEG.0 netmask 255.255.255.0 {
+  range $POOL_I $IPF;
+  option routers $GW;
+  option domain-name-servers 8.8.8.8, 8.8.4.4;
 }
 EOF"
-                    # 2. Forzar al servidor a escuchar SOLO en ens34
-                    sudo sed -i "s/INTERFACESv4=\".*\"/INTERFACESv4=\"$IFACE\"/" /etc/default/isc-dhcp-server
+                sudo sed -i 's/INTERFACESv4=".*"/INTERFACESv4="ens34"/' /etc/default/isc-dhcp-server
+                sudo systemctl restart isc-dhcp-server > /dev/null 2>&1
 
-                    # 3. Reiniciar el servicio
-                    sudo systemctl restart isc-dhcp-server
-                    echo -e "\e[32mConfiguracion aplicada exitosamente en la interfaz $IFACE.\e[0m"
-                fi
-            else
-                echo -e "\e[31mError: Formato de IP invalido.\e[0m"
+                # --- RESUMEN FINAL CON RESET DE COLOR ---
+                clear
+                echo -e "\e[32m========================================"
+                echo "        RESUMEN DE CONFIGURACION"
+                echo "========================================"
+                echo "Ambito:           $ambito"
+                echo "Ip inicial:       $IPI"
+                echo "Ip final:         $IPF"
+                echo "Rango de la ip:   $POOL_I - $IPF"
+                echo "DNS:              8.8.8.8, 8.8.4.4"
+                echo "Gateway:          $GW"
+                echo "Tiempo concesion: 8 Horas"
+                echo -e "========================================\e[0m"
             fi
             ;;
         3)
-            echo "--- MONITOR DE CONCESIONES (Leases) ---"
-            # Muestra las IPs que el servidor ha entregado
-            sudo grep "lease" /var/lib/dhcp/dhcpd.leases | sort | uniq
+            echo "--- CONCESIONES ACTIVAS ---"
+            [ -f /var/lib/dhcp/dhcpd.leases ] && sudo grep -E "lease|hostname" /var/lib/dhcp/dhcpd.leases | tail -n 10 || echo "No hay concesiones."
             ;;
         4)
-            echo "Desinstalando y purgando configuraciones..."
-            sudo systemctl stop isc-dhcp-server
-            sudo apt-get purge isc-dhcp-server -y -qq
+            echo "Borrando sistema..."
+            sudo systemctl stop isc-dhcp-server > /dev/null 2>&1
+            sudo apt-get purge isc-dhcp-server -y -qq > /dev/null 2>&1
             sudo rm -rf /etc/dhcp
-            echo -e "\e[33mSistema limpio. Servicio eliminado.\e[0m"
+            echo -e "\e[33mSistema Limpio\e[0m"
             ;;
         5) exit ;;
-        *) echo "Opcion no valida." ;;
     esac
 done
