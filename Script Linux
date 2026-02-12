@@ -1,135 +1,338 @@
 #!/bin/bash
 
-# =========================================================
-#       SISTEMA DE GESTIÓN DHCP PROFESIONAL (LINUX)
-# =========================================================
+# Archivo de registro persistente (No se borra con la opción 4)
+LOG_HISTORIAL="/var/log/dhcp_gestion_acciones.log"
 
-# 1. Validaciones de Red
+# Función para guardar historial
+registrar_log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | sudo tee -a "$LOG_HISTORIAL" > /dev/null
+}
+
+# 1. Validaciones
 validar_ip() {
-    local ip=$1
-    if [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-        local oct1=$(echo $ip | cut -d. -f1)
-        if [ "$oct1" -eq 127 ] || [ "$oct1" -eq 0 ] || [ "$oct1" -ge 224 ]; then
-            echo -e "\e[31m[!] IP Prohibida (Loopback o Reservada)\e[0m"
-            return 1
-        fi
-        return 0
-    fi
-    echo -e "\e[31m[!] Formato de IP invalido\e[0m"
-    return 1
+    [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
 }
 
 validar_rango() {
-    local r1=$(echo $1 | cut -d. -f1-3)
-    local r2=$(echo $2 | cut -d. -f1-3)
-    local h1=$(echo $1 | cut -d. -f4)
-    local h2=$(echo $2 | cut -d. -f4)
-
-    if [ "$r1" != "$r2" ]; then
-        echo -e "\e[31m[ERROR] Las IPs deben pertenecer al mismo segmento\e[0m"
-        return 1
-    fi
-    if [ "$h1" -ge "$h2" ]; then
-        echo -e "\e[31m[ERROR] La IP inicial debe ser menor a la final\e[0m"
-        return 1
-    fi
-    return 0
+    local r1=$(echo $1 | cut -d. -f1-3); local r2=$(echo $2 | cut -d. -f1-3)
+    [ "$r1" == "$r2" ] && [ $(echo $1 | cut -d. -f4) -lt $(echo $2 | cut -d. -f4) ]
 }
 
-# 2. Configuracion Forzada de IP Estatica (Servidor)
+# 2. Configuración de Red
 configurar_red_servidor() {
     local ip=$1
     local iface="ens34"
-    echo -e "Aplicando IP fija $ip en $iface..."
     sudo ip addr flush dev $iface
     sudo ip addr add $ip/24 dev $iface
     sudo ip link set $iface up
+    registrar_log "IP Estática configurada: $ip en $iface"
+}
+
+# 3. Monitoreo INTELIGENTE - Detecta clientes basándose en si NO están "free"
+monitoreo_activo() {
+    echo -e "\e[33mIniciando monitoreo en tiempo real...\e[0m"
+    echo -e "\e[33mPresione Enter en cualquier momento para volver al menú\e[0m"
+    sleep 2
+    
+    # Buscar archivo de leases
+    local leases_file=""
+    local posibles_leases=(
+        "/var/lib/dhcp/dhcpd.leases"
+        "/var/lib/dhcpd/dhcpd.leases"
+        "/var/db/dhcpd/dhcpd.leases"
+    )
+    
+    for file in "${posibles_leases[@]}"; do
+        if [ -f "$file" ]; then
+            leases_file="$file"
+            break
+        fi
+    done
+    
+    # Loop de monitoreo
+    while true; do
+        clear
+        echo -e "\e[34m=========================================================="
+        echo -e "           SISTEMA DE MONITOREO DE RED ACTIVA"
+        echo -e "           (Actualización automática cada 3 segundos)"
+        echo -e "==========================================================\e[0m"
+        echo -e "\e[1mIP CLIENTE\t\tMAC ADDRESS\t\tHOSTNAME\t\tESTADO\e[0m"
+        echo "-----------------------------------------------------------------------------------"
+
+        if [ -z "$leases_file" ] || [ ! -f "$leases_file" ]; then
+            echo -e "\e[31mERROR: Archivo de concesiones no encontrado\e[0m"
+        elif [ ! -s "$leases_file" ]; then
+            echo -e "\e[33mEsperando conexiones... (Archivo vacío)\e[0m"
+        else
+            # NUEVA LÓGICA: Mostrar solo IPs que NO estén "free"
+            # Si un cliente hace release, su estado cambia a "free" y desaparece
+            # Si está conectado, tendrá cualquier otro estado (active, state, etc.)
+            
+            resultado=$(sudo awk '
+                /^lease / { 
+                    ip = $2
+                }
+                /binding state/ { 
+                    st = $3
+                    gsub(";","",st)
+                    estado_temp = st
+                }
+                /hardware ethernet/ { 
+                    mac = $3
+                    gsub(";","",mac)
+                    mac_temp = mac
+                }
+                /client-hostname/ { 
+                    h = $2
+                    gsub("[\";]","",h)
+                    host_temp = (h != "") ? h : "Desconocido"
+                }
+                /^}/ {
+                    # Guardar datos (última entrada gana)
+                    if (ip != "") {
+                        estado[ip] = estado_temp
+                        macs[ip] = mac_temp
+                        host[ip] = host_temp
+                    }
+                    # Reset
+                    ip = ""
+                    estado_temp = ""
+                    mac_temp = "N/A"
+                    host_temp = "Desconocido"
+                }
+                END {
+                    # Mostrar SOLO las que NO sean "free"
+                    for (i in estado) {
+                        if (estado[i] != "free") {
+                            printf "%s\t%s\t%s\tCONECTADO\n", i, macs[i], host[i]
+                        }
+                    }
+                }
+            ' "$leases_file")
+            
+            if [ -z "$resultado" ]; then
+                echo -e "\e[33mNo hay clientes conectados actualmente.\e[0m"
+                echo -e "\e[90m(Clientes que hicieron 'ipconfig /release' no se muestran)\e[0m"
+                echo ""
+                echo -e "\e[36m📋 Historial de IPs:\e[0m"
+                sudo awk '
+                    /^lease / { ip=$2 }
+                    /binding state/ { st=$3; gsub(";","",st); estado[ip]=st }
+                    /^}/ { 
+                        if(ip!="" && estado[ip]!="") { 
+                            if(estado[ip]=="free") 
+                                print "  \033[90m"ip" (liberada - ipconfig /release)\033[0m"
+                            else 
+                                print "  \033[33m"ip" (estado: "estado[ip]")\033[0m"
+                            ip=""; estado[ip]="" 
+                        } 
+                    }
+                ' "$leases_file" | sort -u
+            else
+                echo -e "\n\e[1;32m=== CLIENTES CONECTADOS ===\e[0m"
+                echo "$resultado" | sort -u -t $'\t' -k1,1 | while IFS=$'\t' read -r ip mac hostname estado; do
+                    printf "\e[32m✓ %-16s %-20s %-20s %s\e[0m\n" "$ip" "$mac" "$hostname" "$estado"
+                done
+                
+                local count=$(echo "$resultado" | sort -u -t $'\t' -k1,1 | wc -l)
+                echo ""
+                echo -e "\e[1;32m✓ Total de clientes conectados: $count\e[0m"
+            fi
+            
+            # Mostrar ARP
+            echo -e "\n\e[1;35m=== DISPOSITIVOS EN LA RED (ARP) ===\e[0m"
+            local arp_output=$(sudo arp -n 2>/dev/null | grep -v "incomplete" | grep "ens34")
+            if [ ! -z "$arp_output" ]; then
+                echo "$arp_output" | awk '{print "  "$1"\t"$3}' | head -10
+            else
+                echo -e "  \e[90mNo hay dispositivos en la tabla ARP para ens34\e[0m"
+            fi
+        fi
+        
+        echo -e "\n-----------------------------------------------------------------------------------"
+        echo -e "\e[36mEstadísticas del servidor:\e[0m"
+        echo -e "  - Servicio DHCP: \e[1m$(systemctl is-active isc-dhcp-server 2>/dev/null || echo 'inactivo')\e[0m"
+        echo -e "  - Archivo leases: ${leases_file:-'NO ENCONTRADO'}"
+        if [ -f "$leases_file" ]; then
+            echo -e "  - Tamaño: $(sudo ls -lh "$leases_file" 2>/dev/null | awk '{print $5}')"
+            echo -e "  - Modificado: $(sudo stat -c %y "$leases_file" 2>/dev/null | cut -d'.' -f1)"
+        fi
+        echo -e "\n\e[1;33m[Presione Enter para volver al menú]\e[0m"
+        
+        # Esperar 3 segundos O Enter
+        read -t 3 input
+        if [ $? -eq 0 ]; then
+            break
+        fi
+    done
 }
 
 # --- MENU PRINCIPAL ---
 while true; do
-    echo -e "\n========================================"
-    echo "        MENU GESTION DHCP (LINUX)"
-    echo "========================================"
-    echo "1) Verificar Instalacion"
-    echo "2) Instalacion + Scope (Completo)"
-    echo "3) Monitoreo de Concesiones"
+    clear
+    echo -e "========================================"
+    echo -e "       GESTOR DHCP PROFESIONAL"
+    echo -e "========================================"
+    echo "1) Verificar Estado del Sistema"
+    echo "2) Instalación + Configuración de Scope"
+    echo "3) Monitoreo de Clientes (Tiempo Real)"
     echo "4) Limpieza Total del Sistema"
-    echo "5) Salir"
-    read -p "Elija una opcion: " opcion
+    echo "5) Ver Historial de Acciones"
+    echo "6) Ver Archivo de Leases Completo"
+    echo "7) Diagnóstico Completo"
+    echo "8) Salir"
+    read -p "Seleccione opción: " opcion
 
     case $opcion in
         1)
+            echo -e "\n\e[1;36m=== ESTADO DEL SISTEMA DHCP ===\e[0m"
             if dpkg -l | grep -q isc-dhcp-server; then
-                echo -e "\e[32mEstado: Instalado\e[0m"
+                echo -e "DHCP Server: \e[32m✓ Instalado\e[0m"
+                echo -e "Estado: \e[1m$(systemctl is-active isc-dhcp-server 2>/dev/null)\e[0m"
+                echo -e "Habilitado: $(systemctl is-enabled isc-dhcp-server 2>/dev/null || echo 'disabled')"
+                echo -e "\n\e[1mConfiguración actual:\e[0m"
+                [ -f /etc/dhcp/dhcpd.conf ] && sudo cat /etc/dhcp/dhcpd.conf | grep -v "^#" | grep -v "^$" || echo "No configurado"
+                echo -e "\n\e[1mArchivo de leases:\e[0m"
+                ls -lh /var/lib/dhcp/dhcpd.leases 2>/dev/null || ls -lh /var/lib/dhcpd/dhcpd.leases 2>/dev/null || echo "No encontrado"
             else
-                echo -e "\e[33mEstado: Limpio\e[0m"
+                echo -e "DHCP Server: \e[31m✗ No instalado\e[0m"
             fi
+            read -p "Presione Enter..."
             ;;
         2)
-            if ! dpkg -l | grep -q isc-dhcp-server; then
-                echo "Instalando servicio silenciosamente..."
-                sudo apt-get update -qq && sudo apt-get install isc-dhcp-server -y -qq > /dev/null 2>&1
-            fi
-
-            read -p "Nombre del Ambito: " ambito
+            echo -e "\n\e[1;36m=== INSTALACIÓN Y CONFIGURACIÓN ===\e[0m"
+            echo "Instalando componentes..."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -y -qq > /dev/null 2>&1
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install isc-dhcp-server -y -qq > /dev/null 2>&1
             
-            while true; do
-                read -p "IP Inicial (Sera la IP Fija del Servidor): " IPI
-                validar_ip $IPI && break
-            done
-            while true; do
-                read -p "IP Final del Rango: " IPF
-                validar_ip $IPF && break
-            done
-
-            if validar_rango $IPI $IPF; then
+            echo -e "\n--- CONFIGURACIÓN DEL SCOPE ---"
+            read -p "Nombre del Ámbito: " ambito
+            read -p "IP del Servidor (Fija): " IPI
+            read -p "IP Final del Rango: " IPF
+            
+            read -p "¿Configurar Gateway? (s/n): " config_gw
+            GATEWAY=""
+            [[ $config_gw == "s" || $config_gw == "S" ]] && read -p "IP del Gateway: " GATEWAY
+            
+            read -p "¿Configurar DNS? (s/n): " config_dns
+            DNS1=""
+            DNS2=""
+            if [[ $config_dns == "s" || $config_dns == "S" ]]; then
+                read -p "DNS Primario: " DNS1
+                read -p "DNS Secundario (opcional): " DNS2
+            fi
+            
+            if validar_ip $IPI && validar_ip $IPF && validar_rango $IPI $IPF; then
                 configurar_red_servidor $IPI
-                
                 SEG=$(echo $IPI | cut -d. -f1-3)
                 POOL_I="$SEG.$(( $(echo $IPI | cut -d. -f4) + 1 ))"
-                GW="$SEG.1"
                 
-                sudo bash -c "cat <<EOF > /etc/dhcp/dhcpd.conf
-authoritative;
+                CONFIG="authoritative;
 default-lease-time 28800;
 max-lease-time 28800;
 
 subnet $SEG.0 netmask 255.255.255.0 {
-  range $POOL_I $IPF;
-  option routers $GW;
-  option domain-name-servers 8.8.8.8, 8.8.4.4;
-}
-EOF"
-                sudo sed -i 's/INTERFACESv4=".*"/INTERFACESv4="ens34"/' /etc/default/isc-dhcp-server
-                sudo systemctl restart isc-dhcp-server > /dev/null 2>&1
+  range $POOL_I $IPF;"
 
-                # --- RESUMEN FINAL CON RESET DE COLOR ---
-                clear
-                echo -e "\e[32m========================================"
-                echo "        RESUMEN DE CONFIGURACION"
-                echo "========================================"
-                echo "Ambito:           $ambito"
-                echo "Ip inicial:       $IPI"
-                echo "Ip final:         $IPF"
-                echo "Rango de la ip:   $POOL_I - $IPF"
-                echo "DNS:              8.8.8.8, 8.8.4.4"
-                echo "Gateway:          $GW"
-                echo "Tiempo concesion: 8 Horas"
-                echo -e "========================================\e[0m"
+                [ ! -z "$GATEWAY" ] && validar_ip $GATEWAY && CONFIG="$CONFIG
+  option routers $GATEWAY;"
+                
+                if [ ! -z "$DNS1" ] && validar_ip $DNS1; then
+                    if [ ! -z "$DNS2" ] && validar_ip $DNS2; then
+                        CONFIG="$CONFIG
+  option domain-name-servers $DNS1, $DNS2;"
+                    else
+                        CONFIG="$CONFIG
+  option domain-name-servers $DNS1;"
+                    fi
+                fi
+                
+                CONFIG="$CONFIG
+}"
+
+                echo "$CONFIG" | sudo tee /etc/dhcp/dhcpd.conf > /dev/null
+                sudo sed -i 's/INTERFACESv4=\".*\"/INTERFACESv4=\"ens34\"/' /etc/default/isc-dhcp-server
+                
+                sudo mkdir -p /var/lib/dhcp
+                sudo touch /var/lib/dhcp/dhcpd.leases
+                sudo chmod 644 /var/lib/dhcp/dhcpd.leases
+                
+                sudo systemctl restart isc-dhcp-server
+                sleep 2
+                
+                if systemctl is-active --quiet isc-dhcp-server; then
+                    echo -e "\n\e[32m✓ ¡Servidor DHCP configurado correctamente!\e[0m"
+                    echo -e "\nConfiguración:"
+                    echo "  - Rango: $POOL_I - $IPF"
+                    [ ! -z "$GATEWAY" ] && echo "  - Gateway: $GATEWAY"
+                    [ ! -z "$DNS1" ] && echo "  - DNS: $DNS1$([ ! -z "$DNS2" ] && echo ", $DNS2")"
+                else
+                    echo -e "\n\e[31m✗ Error al iniciar el servicio\e[0m"
+                    echo "Ver logs: sudo journalctl -u isc-dhcp-server -n 20"
+                fi
+                
+                registrar_log "Scope: $ambito. Rango: $POOL_I-$IPF. GW: ${GATEWAY:-N/A}. DNS: ${DNS1:-N/A}"
+            else
+                echo -e "\e[31m✗ Error: IPs inválidas\e[0m"
             fi
+            sleep 3
             ;;
-        3)
-            echo "--- CONCESIONES ACTIVAS ---"
-            [ -f /var/lib/dhcp/dhcpd.leases ] && sudo grep -E "lease|hostname" /var/lib/dhcp/dhcpd.leases | tail -n 10 || echo "No hay concesiones."
+        3) 
+            monitoreo_activo
             ;;
         4)
-            echo "Borrando sistema..."
+            echo -e "\e[33mEliminando sistema DHCP...\e[0m"
             sudo systemctl stop isc-dhcp-server > /dev/null 2>&1
             sudo apt-get purge isc-dhcp-server -y -qq > /dev/null 2>&1
-            sudo rm -rf /etc/dhcp
-            echo -e "\e[33mSistema Limpio\e[0m"
+            sudo apt-get autoremove -y -qq > /dev/null 2>&1
+            sudo rm -rf /etc/dhcp /var/lib/dhcp /var/lib/dhcpd
+            registrar_log "Sistema eliminado completamente"
+            echo -e "\e[32m✓ Limpieza completada\e[0m"
+            sleep 2
             ;;
-        5) exit ;;
+        5)
+            clear
+            echo -e "\e[1;36m=== HISTORIAL DE ACCIONES ===\e[0m"
+            [ -f "$LOG_HISTORIAL" ] && tail -n 25 "$LOG_HISTORIAL" || echo "Sin registros"
+            read -p "Presione Enter..."
+            ;;
+        6)
+            clear
+            echo -e "\e[1;36m=== ARCHIVO DE LEASES COMPLETO ===\e[0m"
+            local lf="/var/lib/dhcp/dhcpd.leases"
+            [ ! -f "$lf" ] && lf="/var/lib/dhcpd/dhcpd.leases"
+            
+            if [ -f "$lf" ]; then
+                sudo cat "$lf"
+                echo -e "\n\e[1m--- RESUMEN ---\e[0m"
+                echo "Total leases: $(sudo grep -c '^lease' "$lf")"
+                echo "Estados:"
+                sudo grep 'binding state' "$lf" | awk '{print $3}' | sort | uniq -c
+            else
+                echo "Archivo no encontrado"
+            fi
+            read -p "Presione Enter..."
+            ;;
+        7)
+            clear
+            echo -e "\e[1;36m=== DIAGNÓSTICO COMPLETO ===\e[0m\n"
+            echo "1. SERVICIO:"
+            systemctl status isc-dhcp-server --no-pager 2>/dev/null | head -15 || echo "No instalado"
+            echo -e "\n2. RED (ens34):"
+            ip addr show ens34 2>/dev/null || echo "Interfaz no encontrada"
+            echo -e "\n3. CONFIGURACIÓN:"
+            [ -f /etc/dhcp/dhcpd.conf ] && sudo cat /etc/dhcp/dhcpd.conf || echo "No existe"
+            echo -e "\n4. LOGS (últimos 10):"
+            sudo journalctl -u isc-dhcp-server -n 10 --no-pager 2>/dev/null || echo "No disponible"
+            read -p "Presione Enter..."
+            ;;
+        8) 
+            echo "Saliendo..."
+            exit 0
+            ;;
+        *)
+            echo -e "\e[31m✗ Opción inválida\e[0m"
+            sleep 1
+            ;;
     esac
 done
